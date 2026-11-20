@@ -5869,14 +5869,31 @@ function getFreeTableSeat(tb) {
   return null;
 }
 
+const MAX_QUEUE_CAPACITY = 6; // Strictly 6 footprint spots on the queue carpet — when full, no new customer can join!
+
+function getActiveQueueCount(mode) {
+  let count = customers.filter(c =>
+    !c.remove &&
+    c.mode === mode &&
+    (c.state === 'walking_sidewalk' || c.state === 'entering_door' || c.state === 'queuing')
+  ).length;
+  if (lineCutterNPC.active && lineCutterNPC.mode === mode) {
+    count++;
+  }
+  return count;
+}
+
 function spawnCustomerGroup(mode = 'dineIn') {
   if (mode === 'lineUp' && !state.lineUpUnlocked) return;
-  const queuedInMode = customers.filter(c => c.mode === mode && (c.state === 'walking_sidewalk' || c.state === 'entering_door' || c.state === 'queuing'));
-  if (queuedInMode.length >= 6) return;
+  const activeInQueue = getActiveQueueCount(mode);
+  if (activeInQueue >= MAX_QUEUE_CAPACITY) return;
 
-  const groupSize = mode === 'dineIn'
-    ? (Math.random() < 0.45 ? 1 : (Math.random() < 0.75 ? 2 : 3))
+  const remainingSlots = MAX_QUEUE_CAPACITY - activeInQueue;
+  const rawGroupSize = mode === 'dineIn'
+    ? (Math.random() < 0.50 ? 1 : 2)
     : 1;
+  const groupSize = Math.min(rawGroupSize, remainingSlots);
+  if (groupSize <= 0) return;
 
   const shirtPalette = [0xef4444, 0x3b82f6, 0x10b981, 0xf59e0b, 0x8b5cf6, 0xec4899, 0x14b8a6];
   const spawnFromLeft = Math.random() < 0.5;
@@ -5884,7 +5901,7 @@ function spawnCustomerGroup(mode = 'dineIn') {
   const isLuxury = state.levelIndex >= 5;
 
   for (let i = 0; i < groupSize; i++) {
-    if (queuedInMode.length + i >= 6) break;
+    if (getActiveQueueCount(mode) >= MAX_QUEUE_CAPACITY) break;
     const foodSt = getRandomUnlockedStation('food');
     const drinkSt = Math.random() < 0.72 ? getRandomUnlockedStation('drink') : null;
 
@@ -6284,16 +6301,24 @@ function spawnMillionaire(forceReset = true, forceSecretMillionaire = false) {
 function spawnLineCutter(forceSpawn = false) {
   if (lineCutterNPC.active && !forceSpawn) return;
 
-  const dineInQueue = customers.filter(c => c.mode === 'dineIn' && c.state === 'queuing');
-  const lineUpQueue = state.lineUpUnlocked ? customers.filter(c => c.mode === 'lineUp' && c.state === 'queuing') : [];
+  const dineInQueue = customers.filter(c => !c.remove && c.mode === 'dineIn' && (c.state === 'queuing' || c.state === 'entering_door' || c.state === 'walking_sidewalk'));
+  const lineUpQueue = state.lineUpUnlocked ? customers.filter(c => !c.remove && c.mode === 'lineUp' && (c.state === 'queuing' || c.state === 'entering_door' || c.state === 'walking_sidewalk')) : [];
 
   const eligibleModes = [];
-  if (dineInQueue.length >= 2) eligibleModes.push('dineIn');
-  if (state.lineUpUnlocked && lineUpQueue.length >= 2) eligibleModes.push('lineUp');
+  if (dineInQueue.length >= 2 && dineInQueue.length < MAX_QUEUE_CAPACITY) eligibleModes.push('dineIn');
+  if (state.lineUpUnlocked && lineUpQueue.length >= 2 && lineUpQueue.length < MAX_QUEUE_CAPACITY) eligibleModes.push('lineUp');
 
   if (eligibleModes.length === 0) {
     if (!forceSpawn) return;
-    const chosenMode = (state.lineUpUnlocked && Math.random() < 0.5) ? 'lineUp' : 'dineIn';
+    const chosenMode = (state.lineUpUnlocked && lineUpQueue.length < MAX_QUEUE_CAPACITY && Math.random() < 0.5) ? 'lineUp' : 'dineIn';
+    if (getActiveQueueCount(chosenMode) >= MAX_QUEUE_CAPACITY) {
+      // Remove the last arriving customer to make room for the test-spawned Line-Cutter so queue never exceeds 6!
+      const excess = customers.find(c => !c.remove && c.mode === chosenMode && c.state === 'queuing');
+      if (excess) {
+        if (excess.rig && excess.rig.group) scene.remove(excess.rig.group);
+        excess.remove = true;
+      }
+    }
     spawnCustomerGroup(chosenMode);
     eligibleModes.push(chosenMode);
   }
@@ -7510,32 +7535,58 @@ function updateCustomers(dt) {
         c.state = 'entering_door';
       }
     } else if (c.state === 'entering_door') {
-      // Unobstructed straight entry through the doorway!
-      const dy = doorWay.insideY - c.y;
-      const dx = enterDoorX - c.x;
-      const d = Math.hypot(dx, dy);
-      if (d <= 8) {
-        c.x = enterDoorX;
-        c.y = doorWay.insideY;
-        c.queueSeq = ++queueArrivalSeq;
-        c.state = 'queuing';
-        isMoving = false;
-      } else {
-        const step = Math.min(d, 130 * dt);
-        c.x += (dx / d) * step;
-        c.y += (dy / d) * step;
-        c.facingAngle = Math.atan2(dx, dy);
+      // If the queue reached its 6-spot capacity before this customer stepped inside, they turn away instead of piling up!
+      const alreadyQueuedHere = customers.filter(other =>
+        other !== c && !other.remove && other.mode === c.mode && other.state === 'queuing'
+      ).length + ((lineCutterNPC.active && lineCutterNPC.mode === c.mode) ? 1 : 0);
+      if (alreadyQueuedHere >= MAX_QUEUE_CAPACITY) {
+        c.exitSideX = c.x < doorWay.x ? 60 : 920;
+        c.state = 'leaving_sidewalk';
         isMoving = true;
+      } else {
+        // Unobstructed straight entry through the doorway!
+        const dy = doorWay.insideY - c.y;
+        const dx = enterDoorX - c.x;
+        const d = Math.hypot(dx, dy);
+        if (d <= 8) {
+          c.x = enterDoorX;
+          c.y = doorWay.insideY;
+          c.queueSeq = ++queueArrivalSeq;
+          c.state = 'queuing';
+          isMoving = false;
+        } else {
+          const step = Math.min(d, 130 * dt);
+          c.x += (dx / d) * step;
+          c.y += (dy / d) * step;
+          c.facingAngle = Math.atan2(dx, dy);
+          isMoving = true;
+        }
       }
     } else if (c.state === 'queuing') {
       const qIndex = Math.max(0, qList.indexOf(c));
+      // Strictly 1 customer per queue spot! If a customer is ever beyond spot 5 (index >= 6), send excess to leave cleanly so 2 customers NEVER stack on spot 5!
+      if (qIndex >= MAX_QUEUE_CAPACITY) {
+        c.leaveTimer = 0;
+        c.state = 'leaving_to_door';
+        return;
+      }
       const targetX = cnt.x + 52 + qIndex * 32;
       const targetY = cnt.y;
 
-      if (c.y > targetY + 28 && Math.abs(c.x - targetX) > 18) {
-        isMoving = !moveTowards(c, targetX, targetY + 24, 128, dt);
+      // Prevent a newly arriving queue customer from walking through/on top of the customer directly ahead of them in line!
+      let desiredX = targetX;
+      let desiredY = targetY;
+      if (qIndex > 0) {
+        const aheadCust = qList[qIndex - 1];
+        if (aheadCust && Math.hypot(c.x - aheadCust.x, c.y - aheadCust.y) < 28 && c.x < aheadCust.x + 24) {
+          desiredX = Math.max(targetX, aheadCust.x + 32);
+        }
+      }
+
+      if (c.y > desiredY + 28 && Math.abs(c.x - desiredX) > 18) {
+        isMoving = !moveTowards(c, desiredX, desiredY + 24, 128, dt);
       } else {
-        isMoving = !moveTowards(c, targetX, targetY, 128, dt);
+        isMoving = !moveTowards(c, desiredX, desiredY, 128, dt);
       }
 
       if (!isMoving) {
@@ -8083,42 +8134,45 @@ function updateSpecialNPCs(dt) {
           spawnFloatingText('🤝🚶‍♂️', lineCutterNPC.x, lineCutterNPC.y - 35, '#4ade80');
           showAlert('🤝 Kaynakçı İkna Oldu! Kuyruğun En Arkasına Geçip Sırasını Bekliyor!');
 
-          // Convert the persuaded Line-Cutter directly into a real customer at the VERY BACK of that queue!
-        const foodSt = getRandomUnlockedStation('food');
-        const drinkSt = Math.random() < 0.65 ? getRandomUnlockedStation('drink') : null;
-        const teaGlassMesh = createInceBelliCayMesh(true);
-        teaGlassMesh.position.set(0, -0.58, 0.24);
-        teaGlassMesh.visible = false;
-        lineCutterNPC.rig.rightArmPivot.add(teaGlassMesh);
+          // Convert the persuaded Line-Cutter directly into a real customer at the VERY BACK of that queue (or leave if all 6 spots are already taken)!
+          const targetQMode = lineCutterNPC.mode || 'dineIn';
+          const alreadyInQueue = customers.filter(c => !c.remove && c.mode === targetQMode && c.state === 'queuing').length;
+          const joinState = alreadyInQueue < MAX_QUEUE_CAPACITY ? 'queuing' : 'leaving_to_door';
+          const foodSt = getRandomUnlockedStation('food');
+          const drinkSt = Math.random() < 0.65 ? getRandomUnlockedStation('drink') : null;
+          const teaGlassMesh = createInceBelliCayMesh(true);
+          teaGlassMesh.position.set(0, -0.58, 0.24);
+          teaGlassMesh.visible = false;
+          lineCutterNPC.rig.rightArmPivot.add(teaGlassMesh);
 
-        customers.push({
-          id: Math.random(),
-          queueSeq: ++queueArrivalSeq, // Places them strictly at the back of the FIFO queue!
-          mode: lineCutterNPC.mode || 'dineIn',
-          x: lineCutterNPC.x,
-          y: lineCutterNPC.y,
-          state: 'queuing',
-          wantFood: foodSt ? foodSt.itemKey : 'doner',
-          wantFoodQty: 1,
-          gotFoodCount: 0,
-          wantDrink: drinkSt ? drinkSt.itemKey : null,
-          wantDrinkQty: drinkSt ? 1 : 0,
-          gotDrinkCount: 0,
-          gotFood: false,
-          gotDrink: !drinkSt,
-          pickupTimer: 0,
-          eatTimer: 0,
-          eatDuration: 8.5 + Math.random() * 3.5,
-          teaTimer: 0,
-          wcTimer: 0,
-          table: null,
-          seat: null,
-          facingAngle: lineCutterNPC.facingAngle,
-          walkCycle: lineCutterNPC.walkCycle,
-          tray: [],
-          teaGlassMesh,
-          rig: lineCutterNPC.rig
-        });
+          customers.push({
+            id: Math.random(),
+            queueSeq: ++queueArrivalSeq, // Places them strictly at the back of the FIFO queue!
+            mode: targetQMode,
+            x: lineCutterNPC.x,
+            y: lineCutterNPC.y,
+            state: joinState,
+            wantFood: foodSt ? foodSt.itemKey : 'doner',
+            wantFoodQty: 1,
+            gotFoodCount: 0,
+            wantDrink: drinkSt ? drinkSt.itemKey : null,
+            wantDrinkQty: drinkSt ? 1 : 0,
+            gotDrinkCount: 0,
+            gotFood: false,
+            gotDrink: !drinkSt,
+            pickupTimer: 0,
+            eatTimer: 0,
+            eatDuration: 8.5 + Math.random() * 3.5,
+            teaTimer: 0,
+            wcTimer: 0,
+            table: null,
+            seat: null,
+            facingAngle: lineCutterNPC.facingAngle,
+            walkCycle: lineCutterNPC.walkCycle,
+            tray: [],
+            teaGlassMesh,
+            rig: lineCutterNPC.rig
+          });
 
           lineCutterNPC.rig = null;
           lineCutterNPC.active = false;
